@@ -1,0 +1,4 @@
+datasets>=2.0.0
+huggingface_hub>=0.15.0
+# Optional dependency for Claude Code SDK integration
+anthropic>=0.25.0
