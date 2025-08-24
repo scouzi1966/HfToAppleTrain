@@ -12,6 +12,7 @@ Expected format: Each line contains a JSON object with conversation turns:
 import argparse
 import json
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -25,7 +26,8 @@ except ImportError:
 # Optional Claude Code SDK integration
 CLAUDE_AVAILABLE = False
 try:
-    import anthropic
+    import asyncio
+    from claude_code_sdk import ClaudeSDKClient, ClaudeCodeOptions, query
     CLAUDE_AVAILABLE = True
 except ImportError:
     pass
@@ -39,7 +41,7 @@ class DatasetAnalyzer:
         self.analysis_results = {}
         self.conversion_rationale = []
         
-    def analyze_dataset_structure(self, dataset, sample_size: int = 10) -> Dict[str, Any]:
+    def analyze_dataset_structure(self, dataset, sample_size: int = 10, context_file: str = None, instruction: str = None) -> Dict[str, Any]:
         """Analyze dataset structure to determine optimal conversion strategy."""
         sample_data = dataset.select(range(min(sample_size, len(dataset))))
         
@@ -58,7 +60,7 @@ class DatasetAnalyzer:
         }
         
         if self.use_claude:
-            analysis = self._enhance_with_claude_analysis(analysis, sample_data)
+            analysis = self._enhance_with_claude_analysis(analysis, sample_data, context_file, instruction)
         
         self.analysis_results = analysis
         return analysis
@@ -198,17 +200,43 @@ class DatasetAnalyzer:
         
         return available_fields
     
-    def _enhance_with_claude_analysis(self, analysis: Dict, sample_data) -> Dict[str, Any]:
+    def _enhance_with_claude_analysis(self, analysis: Dict, sample_data, context_file: str = None, instruction: str = None) -> Dict[str, Any]:
         """Enhance analysis using Claude Code SDK for deeper insights."""
         try:
-            client = anthropic.Anthropic()
-            
             # Prepare sample for Claude analysis
             sample_str = json.dumps([dict(example) for example in sample_data.select(range(3))], indent=2)
             
+            # Read context file if provided
+            context_content = ""
+            if context_file:
+                try:
+                    with open(context_file, 'r', encoding='utf-8') as f:
+                        context_content = f.read()
+                        self.conversion_rationale.append(f"Loaded context from file: {context_file}")
+                except Exception as e:
+                    self.conversion_rationale.append(f"Failed to read context file {context_file}: {str(e)}")
+            
+            # Build the prompt
             prompt = f"""
             Analyze this dataset sample and provide insights for converting to Apple Foundation Model training format.
             The target format is: [{{"role": "user", "content": "PROMPT"}}, {{"role": "assistant", "content": "RESPONSE"}}]
+            """
+            
+            if context_content:
+                prompt += f"""
+            
+            Context:
+            {context_content}
+            """
+            
+            if instruction:
+                prompt += f"""
+            
+            Additional Instructions:
+            {instruction}
+            """
+            
+            prompt += f"""
             
             Dataset sample:
             {sample_str}
@@ -225,13 +253,8 @@ class DatasetAnalyzer:
             Respond in JSON format with keys: strategy, confidence, issues, alternatives
             """
             
-            response = client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            claude_analysis = json.loads(response.content[0].text)
+            # Use Claude Code SDK instead of direct API calls
+            claude_analysis = asyncio.run(self._query_claude_sdk(prompt))
             analysis['claude_insights'] = claude_analysis
             
             self.conversion_rationale.append(f"Claude Analysis: {claude_analysis}")
@@ -241,6 +264,33 @@ class DatasetAnalyzer:
             self.conversion_rationale.append(f"Claude analysis failed: {str(e)}")
         
         return analysis
+    
+    async def _query_claude_sdk(self, prompt: str) -> Dict[str, Any]:
+        """Query Claude Code SDK with the analysis prompt."""
+        try:
+            # Configure Claude Code SDK options
+            options = ClaudeCodeOptions(
+                system_prompt="You are an expert data scientist specializing in dataset conversion and analysis. Provide detailed, actionable insights in JSON format.",
+                max_turns=1,
+                allowed_tools=[]  # No tools needed for this analysis
+            )
+            
+            # Use the Claude Code SDK query function
+            response_text = ""
+            async for message in query(prompt=prompt, options=options):
+                if hasattr(message, 'content'):
+                    for block in message.content:
+                        if hasattr(block, 'text'):
+                            response_text += block.text
+            
+            # Parse the JSON response
+            claude_analysis = json.loads(response_text)
+            return claude_analysis
+            
+        except json.JSONDecodeError as e:
+            return {'error': f"Failed to parse Claude response as JSON: {str(e)}", 'raw_response': response_text}
+        except Exception as e:
+            return {'error': f"Claude SDK query failed: {str(e)}"}
     
     def generate_conversion_rationale(self, output_dir: str, analysis: Dict, conversion_stats: Dict):
         """Generate detailed rationale file explaining conversion choices."""
@@ -489,6 +539,19 @@ def main():
         action="store_true",
         help="Enable Claude Code SDK integration for intelligent dataset analysis (requires anthropic package)"
     )
+    parser.add_argument(
+        "--context",
+        help="Path to context file to pass to Claude Code (only used with --use-claude-hook)"
+    )
+    parser.add_argument(
+        "--instruct",
+        help="Instructions to provide to Claude (only used with --use-claude-hook)"
+    )
+    parser.add_argument(
+        "--randomize",
+        action="store_true",
+        help="Randomize the data before splitting into train/validation sets"
+    )
     
     args = parser.parse_args()
     
@@ -514,14 +577,19 @@ def main():
     analyzer = None
     if args.use_claude_hook:
         if not CLAUDE_AVAILABLE:
-            print("Warning: Claude Code SDK not available. Install with: pip install anthropic")
+            print("Warning: Claude Code SDK not available. Install with: pip install claude-code-sdk")
             print("Proceeding without intelligent analysis...")
         else:
             print("Initializing Claude Code SDK analyzer...")
             analyzer = DatasetAnalyzer(use_claude=True)
             
             print("Analyzing dataset structure...")
-            analysis = analyzer.analyze_dataset_structure(dataset, sample_size=min(20, len(dataset)))
+            analysis = analyzer.analyze_dataset_structure(
+                dataset, 
+                sample_size=min(20, len(dataset)),
+                context_file=args.context,
+                instruction=args.instruct
+            )
             
             print(f"Analysis complete. Found {len(analysis['recommendations'])} conversion strategies.")
             for i, rec in enumerate(analysis['recommendations'], 1):
@@ -555,6 +623,11 @@ def main():
     if not converted_examples:
         print("No examples were successfully converted. Check your dataset format.")
         sys.exit(1)
+    
+    # Randomize data before splitting if requested
+    if args.randomize:
+        print("Randomizing examples before train/validation split...")
+        random.shuffle(converted_examples)
     
     # Split into train/validation
     split_idx = int(len(converted_examples) * args.train_split_ratio)
